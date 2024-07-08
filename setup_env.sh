@@ -8,7 +8,4 @@ pip install wheel
 pip install -r requirements.txt
 python -m ipykernel install --user --name=neuroNoodle
 
-pip install pre-commit
-pre-commit install
-
 deactivate
