@@ -166,4 +166,7 @@ cython_debug/
 
 # data
 MNE-limo-data/
+data/
 
+# files
+*.csv
