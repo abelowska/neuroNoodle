@@ -71,7 +71,7 @@ def simulate_erp_components_with_conditions(
                 peak_center_stop = peak_center_go + trial_ssd
 
                 if config['interactions']['stop x SSD']:
-                    amplitude_stop = config['stop_intercept'] + (trial_ssd - 0.1) * 1.2
+                    amplitude_stop = config['stop_intercept'] + trial_ssd * 1.2
                 else:
                     amplitude_stop = config['stop_intercept']
                 latency_stop = int((peak_center_stop - peak_width_stop) * sampling_rate)
@@ -89,7 +89,7 @@ def simulate_erp_components_with_conditions(
                     if config['interactions']['response_error x SRI']:
                         amplitude_response = amplitude_response + sri * 1.5  # Amplitude increases with distance
                     if config['interactions']['response_error x SSD']:
-                        amplitude_response = amplitude_response + (trial_ssd - 0.1) * 1.2
+                        amplitude_response = amplitude_response + trial_ssd * 1.2
 
                     peak_center_response = peak_center_stop + sri
                     latency_response = int((peak_center_response - peak_width_response) * sampling_rate)
