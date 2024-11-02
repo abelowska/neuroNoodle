@@ -301,6 +301,7 @@ def simulate_erp_components_with_conditions_test(
                 'peak_center_go': [peak_center_go],
                 'peak_center_stop': [peak_center_stop],
                 'peak_center_response': [peak_center_response],
+                'baseline': [np.mean(erp_trial[:6])],
             })
 
             data_df = pd.concat([data_df, this_df], ignore_index=True)
@@ -321,48 +322,65 @@ def create_events_table(data_df, sampling_rate, duration):
         # Add each event to the list with the appropriate latency and event type
         rows.append({
             'latency': signal_offset + row['Go event latency'],
-            'event': 'go',
-            'SSD': row['SSD'] if pd.notna(row['Go event latency']) else np.nan,
-            'SRI': row['SRI'] if pd.notna(row['Go event latency']) else np.nan,
+            'type': 'go',
+            'ssd': row['SSD'] if pd.notna(row['Go event latency']) else np.nan,
+            'sri': row['SRI'] if pd.notna(row['Go event latency']) else np.nan,
             'stop_type': 'SS' if (row['stop_type'] == 'stop') and (row['response_type'] == 'correct')
             else 'SU' if (row['stop_type'] == 'stop') and (row['response_type'] == 'error')
             else 'n-a',  # Default to NaN or another value if neither condition is met
-            'response_type': row['response_type']
+            'response_type': row['response_type'],
+            'baseline': row['baseline']
+        })
+
+         # Add baseline to the events
+        rows.append({
+            'latency': signal_offset + row['Go event latency'],
+            'type': 'baseline',
+            'ssd': row['SSD'] if pd.notna(row['Go event latency']) else np.nan,
+            'sri': row['SRI'] if pd.notna(row['Go event latency']) else np.nan,
+            'stop_type': 'SS' if (row['stop_type'] == 'stop') and (row['response_type'] == 'correct')
+            else 'SU' if (row['stop_type'] == 'stop') and (row['response_type'] == 'error')
+            else 'n-a',  # Default to NaN or another value if neither condition is met
+            'response_type': row['response_type'],
+            'baseline': row['baseline']
         })
 
         if pd.notna(row['Stop event latency']):
             rows.append({
                 'latency': signal_offset + row['Stop event latency'],
-                'event': 'stop',
-                'SSD': row['SSD'],
-                'SRI': row['SRI'] if pd.notna(row['Response event latency']) else np.nan,
+                'type': 'stop',
+                'ssd': row['SSD'],
+                'sri': row['SRI'] if pd.notna(row['Response event latency']) else np.nan,
                 'stop_type': 'SS' if (row['stop_type'] == 'stop') and (row['response_type'] == 'correct')
                 else 'SU' if (row['stop_type'] == 'stop') and (row['response_type'] == 'error')
                 else 'n-a',  # Default to NaN or another value if neither condition is met
-                'response_type': row['response_type']
+                'response_type': row['response_type'],
+                'baseline': row['baseline']
             })
 
             if pd.notna(row['Response event latency']):
                 rows.append({
                     'latency': signal_offset + row['Response event latency'],
-                    'event': 'response',
-                    'SSD': row['SSD'],
-                    'SRI': row['SRI'],
+                    'type': 'response_stop',
+                    'ssd': row['SSD'],
+                    'sri': row['SRI'],
                     'stop_type': 'SS' if (row['stop_type'] == 'stop') and (row['response_type'] == 'correct')
                     else 'SU' if (row['stop_type'] == 'stop') and (row['response_type'] == 'error')
                     else 'n-a',  # Default to NaN or another value if neither condition is met
-                    'response_type': row['response_type']
+                    'response_type': row['response_type'],
+                    'baseline': row['baseline']
                 })
         else:
             rows.append({
                 'latency': signal_offset + row['Response event latency'],
-                'event': 'response_nostop',
-                'SSD': np.nan,
-                'SRI': np.nan,
+                'type': 'response_nostop',
+                'ssd': np.nan,
+                'sri': np.nan,
                 'stop_type': 'SS' if (row['stop_type'] == 'stop') and (row['response_type'] == 'correct')
                 else 'SU' if (row['stop_type'] == 'stop') and (row['response_type'] == 'error')
                 else 'n-a',  # Default to NaN or another value if neither condition is met
-                'response_type': row['response_type']
+                'response_type': row['response_type'],
+                'baseline': row['baseline']
             })
 
             # Create a new DataFrame from the list
