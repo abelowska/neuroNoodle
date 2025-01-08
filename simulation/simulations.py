@@ -321,7 +321,7 @@ def create_events_table(data_df, sampling_rate, duration):
 
         # Add each event to the list with the appropriate latency and event type
         rows.append({
-            'latency': signal_offset + row['Go event latency'],
+            'latency': int(signal_offset + row['Go event latency']),
             'type': 'go',
             'ssd': row['SSD'] if pd.notna(row['Go event latency']) else np.nan,
             'sri': row['SRI'] if pd.notna(row['Go event latency']) else np.nan,
@@ -334,7 +334,7 @@ def create_events_table(data_df, sampling_rate, duration):
 
          # Add baseline to the events
         rows.append({
-            'latency': signal_offset + row['Go event latency'],
+            'latency': int(signal_offset + row['Go event latency']),
             'type': 'baseline',
             'ssd': row['SSD'] if pd.notna(row['Go event latency']) else np.nan,
             'sri': row['SRI'] if pd.notna(row['Go event latency']) else np.nan,
@@ -347,7 +347,7 @@ def create_events_table(data_df, sampling_rate, duration):
 
         if pd.notna(row['Stop event latency']):
             rows.append({
-                'latency': signal_offset + row['Stop event latency'],
+                'latency': int(signal_offset + row['Stop event latency']),
                 'type': 'stop',
                 'ssd': row['SSD'],
                 'sri': row['SRI'] if pd.notna(row['Response event latency']) else np.nan,
@@ -360,7 +360,7 @@ def create_events_table(data_df, sampling_rate, duration):
 
             if pd.notna(row['Response event latency']):
                 rows.append({
-                    'latency': signal_offset + row['Response event latency'],
+                    'latency': int(signal_offset + row['Response event latency']),
                     'type': 'response_stop',
                     'ssd': row['SSD'],
                     'sri': row['SRI'],
@@ -372,7 +372,7 @@ def create_events_table(data_df, sampling_rate, duration):
                 })
         else:
             rows.append({
-                'latency': signal_offset + row['Response event latency'],
+                'latency': int(signal_offset + row['Response event latency']),
                 'type': 'response_nostop',
                 'ssd': np.nan,
                 'sri': np.nan,

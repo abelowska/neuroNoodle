@@ -1,15 +1,32 @@
+import pickle
+
 import mne
 import numpy as np
 import ipywidgets as widgets
 import seaborn as sns
 from matplotlib import pyplot as plt
-import sys
 from typing import Callable
+import logging
+import pandas as pd
 
-sys.path.insert(1, '../simulation/')
-import simulations
+from simulation import simulations
 
 sampling_rate = 64
+logger = logging.getLogger(__name__)
+
+
+def jl_results_to_python(results_jl):
+    results_py_df = pd.DataFrame({
+        'channel': results_jl.channel,
+        'coefname': results_jl.coefname,
+        'estimate': results_jl.estimate,
+        'eventname': results_jl.eventname,
+        'group': results_jl.group,
+        'stderror': results_jl.stderror,
+        'time': results_jl.time
+    })
+    return results_py_df
+
 
 class EventData:
     def __init__(self, event_name):
@@ -40,10 +57,44 @@ class EventData:
         return self.data.get(coefname, None)
 
 
+def calculate_aic(original, predicted, num_parameters):
+    residuals = original[:predicted.shape[-1]] - predicted
+    sigma_squared = np.var(residuals)  # Variance of the residuals
+    logger.debug(f"Variance of the residuals for AIC: {sigma_squared}")
+    n = len(original)  # Number of observations
+
+    # Log-Likelihood assuming a Gaussian distribution for simplicity 
+    log_likelihood = -n / 2 * np.log(2 * np.pi * sigma_squared) - (1 / (2 * sigma_squared)) * np.sum(residuals ** 2)
+
+    aic = 2 * num_parameters - 2 * log_likelihood
+    bic = np.log(n) * num_parameters - 2 * log_likelihood
+
+    return aic
+
+
 class ResultsContainer:
-    def __init__(self, event_names):
+    def __init__(self, event_names=None, person_id=None, aic=None, num_parameters=None):
+        if event_names is None:
+            event_names = ['baseline', 'go', 'stop', 'response_stop', 'response_nostop', 'evoked']
         self.event_names = event_names
         self.events_data = {event_name: EventData(event_name) for event_name in event_names}
+        self.person_id = person_id
+        self.aic = aic
+        self.num_parameters = num_parameters
+
+    def estimate_aic(self):
+        evoked = self.events_data['evoked']
+        channels = evoked.channels
+
+        aic_channels = {}
+        for index, channel in enumerate(channels):
+            original = evoked.get_channel_data('original')[index]
+            predicted = evoked.get_channel_data('predicted')[index]
+
+            aic = calculate_aic(original.ravel(), predicted.ravel(), self.num_parameters)
+            aic_channels[channel] = aic
+
+        self.aic = aic_channels
 
     def process_results(self, results_df):
         for event_name, event_data in self.events_data.items():
@@ -57,42 +108,109 @@ class ResultsContainer:
                 # Add channel data to the event
                 event_data.add_channel_data(channel, estimates_by_coef, data_df['time'].to_numpy())
 
+        self.estimate_aic()
+
     def get_event_data(self, event_name):
         return self.events_data.get(event_name, None)
 
     def get_all_event_names(self):
         return list(self.events_data.keys())
 
+    @staticmethod
+    def get_id_from_file(file_path):
+        file_name = file_path.split('/')[-1]
+        [first_part, second_part] = file_name.split("_")[:2]
+        if first_part == 'SST3':
+            return second_part
+        else:
+            return first_part
 
-def create_evokeds_from_container(results_obj, sampling_rate, montage='biosemi32'):
-    evoked_dict = {}
+    def process_results_and_store(self, results_df, file_path_prefix):
+        self.person_id = self.get_id_from_file(file_path_prefix)
+        self.process_results(results_df)
+        with open(f'{file_path_prefix}_structured.pickle', 'wb') as handle:
+            pickle.dump(self, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # Iterate over each event in the ResultsContainer
-    for event_name in results_obj.get_all_event_names():
-        event_data = results_obj.get_event_data(event_name)
+    def store_results(self, file_path_prefix):
+        with open(f'{file_path_prefix}_structured.pickle', 'wb') as handle:
+            pickle.dump(self, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-        # Extract channels and times from event_data object
-        channels_list = event_data.channels
-        times = event_data.times
+    @staticmethod
+    def create_average(results_list):
+        if not results_list:
+            raise ValueError("The results_list cannot be empty")
 
-        # Create MNE info object
-        info = mne.create_info(ch_names=channels_list, sfreq=sampling_rate, ch_types='eeg')
+        # Initialize a new ResultsContainer with default settings
+        average_container = ResultsContainer(person_id='all', num_parameters=results_list[0].num_parameters)
 
-        # Iterate over each coefname (e.g., (Intercept), or other coefficients)
-        for coefname, data in event_data.data.items():
-            # data is of shape (n_channels, n_times) for each channel
-            # Create Evoked object directly from the data
-            evoked_data = np.array(data)
-            # cast to V from uV, for MNE
-            evoked_data = evoked_data / 1000000
+        # Assume all ResultsContainer instances have the same structure
+        event_names = results_list[0].get_all_event_names()
 
-            # Create mne.EvokedArray, time should start from the first time point
-            evoked = mne.EvokedArray(evoked_data, info=info, tmin=times[0])
-            evoked.set_montage(montage)
+        for event_name in event_names:
+            event_data_list = [result.get_event_data(event_name) for result in results_list]
 
-            # Store the evoked object for this event_name and coefname
-            evoked_dict[(event_name, coefname)] = evoked
-    return evoked_dict
+            # Create an EventData object to store the averaged data for this event
+            averaged_event_data = EventData(event_name)
+            averaged_times = None  # Assumes times are consistent across ResultsContainer instances
+
+            for channel_index, channel in enumerate(event_data_list[0].channels):
+                # Initialize a dictionary to store the averaged estimates for each coefname
+                averaged_channel_data = {}
+
+                # Collect times from the first EventData instance (assuming consistency)
+                if averaged_times is None:
+                    averaged_times = event_data_list[0].times
+
+                for coefname in event_data_list[0].data:
+                    # Collect estimates for this coefname and channel across all EventData instances
+                    estimates = [
+                        event_data.data[coefname][channel_index] for event_data in event_data_list
+                    ]
+                    # Calculate the mean estimate across all instances
+                    averaged_channel_data[coefname] = np.mean(estimates, axis=0)
+
+                # Add the averaged data for this channel to the averaged EventData
+                averaged_event_data.add_channel_data(channel, averaged_channel_data, averaged_times)
+
+            # Store the averaged EventData in the new ResultsContainer
+            average_container.events_data[event_name] = averaged_event_data
+
+        return average_container
+
+    @staticmethod
+    def read_from_file(file_path):
+        with open(f'{file_path}.pickle', 'rb') as handle:
+            return pickle.load(handle)
+
+    def create_evokeds_from_container(self, sampling_rate, montage='biosemi32'):
+        evoked_dict = {}
+
+        # Iterate over each event in the ResultsContainer
+        for event_name in self.get_all_event_names():
+            event_data = self.get_event_data(event_name)
+
+            # Extract channels and times from event_data object
+            channels_list = event_data.channels
+            times = event_data.times
+
+            # Create MNE info object
+            info = mne.create_info(ch_names=channels_list, sfreq=sampling_rate, ch_types='eeg')
+
+            # Iterate over each coefname (e.g., (Intercept), or other coefficients)
+            for coefname, data in event_data.data.items():
+                # data is of shape (n_channels, n_times) for each channel
+                # Create Evoked object directly from the data
+                evoked_data = np.array(data)
+                # cast to V from uV, for MNE
+                evoked_data = evoked_data / 1000000
+
+                # Create mne.EvokedArray, time should start from the first time point
+                evoked = mne.EvokedArray(evoked_data, info=info, tmin=times[0])
+                evoked.set_montage(montage)
+
+                # Store the evoked object for this event_name and coefname
+                evoked_dict[(event_name, coefname)] = evoked
+        return evoked_dict
 
 
 def average_evoked_across_ids(unfold_results_dict):
@@ -176,10 +294,20 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
     return evoked1, evoked2
 
 
-# def plot_evoked_dict(evoked_dict):
-#     event_names = sorted(set(event for event, _ in evoked_dict.keys()))  # Get unique event names
+# def plot_results_dict(unfold_results_dict):
+#     # Create a dropdown for selecting the ID from unfold_results_dict
+#     id_dropdown = widgets.Dropdown(
+#         options=list(unfold_results_dict.keys()),
+#         description='Select ID:',
+#         value=list(unfold_results_dict.keys())[0]  # Default to the first id
+#     )
+
+#     # Get the corresponding evoked_dict for the initially selected ID
+#     evoked_dict = unfold_results_dict[id_dropdown.value]
 
 #     # Create a dropdown for event names
+#     event_names = sorted(set(event for event, _ in evoked_dict.keys()))  # Get unique event names
+
 #     event_dropdown = widgets.Dropdown(
 #         options=event_names,
 #         description='Event Name:',
@@ -188,14 +316,14 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
 
 #     # Create a toggle for electrodes
 #     electrode_toggle = widgets.Dropdown(
-#         options=evoked_dict[('baseline')].info['ch_names'],  # Add your electrodes here
+#         options=evoked_dict[('baseline', 'baseline')].info['ch_names'],  # Add your electrodes here
 #         description='Electrode:',
 #         value='Cz'
 #     )
 
 #     output = widgets.Output()
 
-#     # Global container for min and max multiplier text boxes
+#     # Local containers for min and max multiplier text boxes and checkboxes
 #     min_multiplier_boxes = []
 #     max_multiplier_boxes = []
 #     coef_checkboxes = []
@@ -208,11 +336,11 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
 #     )
 
 #     def update_coef_checkboxes(event_name):
-#         global min_multiplier_boxes, max_multiplier_boxes, coef_checkboxes
+#         nonlocal min_multiplier_boxes, max_multiplier_boxes, coef_checkboxes
 #         # Extract coefficient names based on the selected event, excluding '(Intercept)'
 #         coefnames = [coef for event, coef in evoked_dict.keys() if event == event_name and coef != '(Intercept)']
 
-#         # Create checkboxes for coefnames
+#         # Reset and create new checkboxes for coefnames
 #         coef_checkboxes = [widgets.Checkbox(value=False, description=name) for name in set(coefnames)]
 
 #         # Reset the min and max multiplier boxes
@@ -238,7 +366,6 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
 #         return widgets.VBox(rows)
 
 #     def update_plot(event_name, coef_selection, selected_electrode, selected_time):
-#         # Clear previous output
 #         with output:
 #             output.clear_output()
 
@@ -258,37 +385,38 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
 #             # Update the slider range based on evoked1 times
 #             time_slider.min = evoked1.times[0]
 #             time_slider.max = evoked1.times[-1]
-#             time_slider.step = evoked1.times[1] - evoked1.times[0]  # Use the time step of the data
+#             time_slider.step = evoked1.times[1] - evoked1.times[0]
 #             if time_slider.value < time_slider.min or time_slider.value > time_slider.max:
-#                 time_slider.value = 0.2  # Set default if it's out of range
+#                 time_slider.value = 0.2
 
 #             # Get the data for the selected electrode
-#             ch_idx = evoked1.ch_names.index(selected_electrode)  # Find index of selected electrode
+#             ch_idx = evoked1.ch_names.index(selected_electrode)
 
 #             # Plot the line plot for the selected electrode
 #             plt.figure(figsize=(12, 6))
 #             plt.plot(evoked1.times, evoked1.data[ch_idx], label='Intercept + Min Multiplier', color='blue')
 #             plt.plot(evoked2.times, evoked2.data[ch_idx], label='Intercept + Max Multiplier', color='red')
-#             plt.axvline(x=0, color='gray', linestyle='--', label=f'Time: 0s')  # Example vertical line at time = 0
-#             plt.title(f'Evoked Response at {selected_electrode}')
+#             plt.axvline(x=0, color='gray', linestyle='--')
+#             title = f'Evoked Response at {selected_electrode}'
+#             if selected_aic is not None:
+#                 title += f' (AIC: {selected_aic:.2f})'
+#             plt.title(title)
 #             plt.xlabel('Time (s)')
 #             plt.ylabel('Amplitude (uV)')
 #             plt.legend()
 #             plt.grid()
 #             plt.show()
 
-#             # Display the slider below the main plot
 #             display(time_slider)
 
 #             mne.viz.plot_evoked_topomap(evoked1, times=selected_time, show=False)
-#             plt.suptitle(f"Intercept + Min Multiplier at time {selected_time:.3f}s")
+#             plt.suptitle(f"Intercept - Min Multiplier at time {selected_time:.3f}s")
 #             plt.show()
 
 #             mne.viz.plot_evoked_topomap(evoked2, times=selected_time, show=False)
 #             plt.suptitle(f"Intercept + Max Multiplier at time {selected_time:.3f}s")
 #             plt.show()
 
-#     # Attach listeners to the checkboxes and multiplier text boxes
 #     def attach_listeners():
 #         for i, checkbox in enumerate(coef_checkboxes):
 #             checkbox.observe(lambda change, idx=i: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
@@ -306,43 +434,57 @@ def create_combined_evoked(event_name, coef_dict, evoked_dict):
 #         lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value,
 #                                    time_slider.value), names='value')
 
-#     # Link the interactive widgets to the update function
+#     def update_evoked_dict(*args):
+#         nonlocal evoked_dict
+#         evoked_dict = unfold_results_dict[id_dropdown.value]
+#         event_names = sorted(set(event for event, _ in evoked_dict.keys()))
+#         event_dropdown.options = event_names
+#         event_dropdown.value = 'baseline'
+#         electrode_toggle.options = evoked_dict[('baseline', 'baseline')].info['ch_names']
+#         electrode_toggle.value = 'Cz'
+#         update_all()
+
 #     def update_all(*args):
-#         # Update coefficient checkboxes and text boxes when the event name changes
 #         coef_checkboxes_widget.children = update_coef_checkboxes(event_dropdown.value).children
-#         # Attach listeners to the new checkboxes and text boxes
 #         attach_listeners()
-#         # Update plot after changing event
 #         update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value, time_slider.value)
 
-#     # Create the initial checkboxes for the default event
-
 #     coef_checkboxes_widget = update_coef_checkboxes(event_dropdown.value)
-
-#     # Attach the event listener to the electrode toggle
-#     electrode_toggle.observe(
-#         lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value,
-#                                    time_slider.value), names='value')
-
-#     # Attach the event listener to the event dropdown
+#     electrode_toggle.observe(lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                         electrode_toggle.value, time_slider.value), names='value')
 #     event_dropdown.observe(lambda change: update_all(), names='value')
+#     id_dropdown.observe(update_evoked_dict, names='value')
 
-#     # Display the widgets and output area
-#     display(event_dropdown, coef_checkboxes_widget, electrode_toggle, output)
+#     display(id_dropdown, event_dropdown, coef_checkboxes_widget, electrode_toggle, output)
 
-#     # Call the update function initially
 #     update_all()
 
-def plot_results_dict(unfold_results_dict):
-    # Create a dropdown for selecting the ID from unfold_results_dict
+def plot_results_containers(results_containers, y_lim=None):
+    sns.set_style("whitegrid")
+    plt.rcParams.update({
+        'font.size': 20,
+        'axes.titlesize': 15,
+        'axes.labelsize': 15,
+        'xtick.labelsize': 15,
+        'ytick.labelsize': 15,
+        'legend.fontsize': 15,
+        'figure.titlesize': 15,
+    })
+    # Create a dictionary of results_containers by person_id for easier lookup
+    containers_dict = {container.person_id: container for container in results_containers}
+
+    # Create a dropdown for selecting the ID from results_containers
     id_dropdown = widgets.Dropdown(
-        options=list(unfold_results_dict.keys()),
+        options=list(containers_dict.keys()),
         description='Select ID:',
-        value=list(unfold_results_dict.keys())[0]  # Default to the first id
+        value=list(containers_dict.keys())[0]  # Default to the first id
     )
-    
-    # Get the corresponding evoked_dict for the initially selected ID
-    evoked_dict = unfold_results_dict[id_dropdown.value]
+
+    # Retrieve the evoked data for the initially selected ID
+    evoked_dict = containers_dict[id_dropdown.value].create_evokeds_from_container(
+        sampling_rate=sampling_rate,
+        montage='biosemi32'
+    )
 
     # Create a dropdown for event names
     event_names = sorted(set(event for event, _ in evoked_dict.keys()))  # Get unique event names
@@ -408,6 +550,11 @@ def plot_results_dict(unfold_results_dict):
         with output:
             output.clear_output()
 
+            # Retrieve AIC value for the selected person_id and electrode
+            selected_id = id_dropdown.value
+            selected_container = containers_dict[selected_id]
+            selected_aic = selected_container.aic.get(selected_electrode, None)
+
             # Prepare coef_dict based on checked boxes, always including '(Intercept)'
             coef_dict = {'(Intercept)': False}  # Default coefficient values
 
@@ -433,10 +580,16 @@ def plot_results_dict(unfold_results_dict):
 
             # Plot the line plot for the selected electrode
             plt.figure(figsize=(12, 6))
-            plt.plot(evoked1.times, evoked1.data[ch_idx], label='Intercept + Min Multiplier', color='blue')
-            plt.plot(evoked2.times, evoked2.data[ch_idx], label='Intercept + Max Multiplier', color='red')
+            # plot signal in uV
+            plt.plot(evoked1.times, evoked1.data[ch_idx] * 1000000, label='Intercept + Min Multiplier', color='blue')
+            plt.plot(evoked2.times, evoked2.data[ch_idx] * 1000000, label='Intercept + Max Multiplier', color='red')
             plt.axvline(x=0, color='gray', linestyle='--')
-            plt.title(f'Evoked Response at {selected_electrode}')
+            if y_lim is not None:
+                plt.ylim(y_lim)
+            title = f'Evoked Response at {selected_electrode}'
+            if selected_aic is not None:
+                title += f' (AIC: {selected_aic:.2f})'
+            plt.title(title)
             plt.xlabel('Time (s)')
             plt.ylabel('Amplitude (uV)')
             plt.legend()
@@ -472,7 +625,10 @@ def plot_results_dict(unfold_results_dict):
 
     def update_evoked_dict(*args):
         nonlocal evoked_dict
-        evoked_dict = unfold_results_dict[id_dropdown.value]
+        evoked_dict = containers_dict[id_dropdown.value].create_evokeds_from_container(
+            sampling_rate=sampling_rate,
+            montage='biosemi32'
+        )
         event_names = sorted(set(event for event, _ in evoked_dict.keys()))
         event_dropdown.options = event_names
         event_dropdown.value = 'baseline'
@@ -495,6 +651,7 @@ def plot_results_dict(unfold_results_dict):
 
     update_all()
 
+
 def plot_unfold_results_effects(results):
     # Extract the coefficients for one channel
     results_channel = results[results.channel == 1]
@@ -506,14 +663,13 @@ def plot_unfold_results_effects(results):
     results_response_nostop = results_channel[results_channel.eventname == 'response_nostop']
 
     sns.set_style("whitegrid")
-
     # Set global font size for various elements
     plt.rcParams.update({
-        'font.size': 25,
-        'axes.titlesize': 30,
-        'axes.labelsize': 30,
-        'xtick.labelsize': 30,
-        'ytick.labelsize': 30,
+        'font.size': 30,
+        'axes.titlesize': 25,
+        'axes.labelsize': 25,
+        'xtick.labelsize': 25,
+        'ytick.labelsize': 25,
         'legend.fontsize': 25,
         'figure.titlesize': 25,
     })
@@ -572,34 +728,251 @@ def plot_unfold_results_effects(results):
 
 # Function to simulate or generate unfold_results_dict based on sri_mean
 def generate_data(data_simulation_function: Callable[[float], dict], sri_mean=0.2):
+    results_list = []
 
-    results_channels = data_simulation_function(sri_mean)
-    
-    event_names = ['baseline', 'go', 'stop', 'response_stop', 'response_nostop']
+    results_channels, num_parameters = data_simulation_function(sri_mean)
+    event_names = ['baseline', 'go', 'stop', 'response_stop', 'response_nostop', 'evoked']
+
     results_obj = ResultsContainer(event_names=event_names)
+    results_obj.num_parameters = num_parameters
     results_obj.process_results(results_channels)
-    
-    unfolded_evokeds = {}
-    person_unfolded_evokeds = create_evokeds_from_container(
-            results_obj=results_obj, 
-            sampling_rate=sampling_rate,
-            montage='biosemi32'
-    )
-    # mock data
-    person_id = 'A1'
-    unfolded_evokeds[person_id] = person_unfolded_evokeds
-    
-    person_id2 = 'A2'
-    unfolded_evokeds[person_id2] = person_unfolded_evokeds
+    results_obj.person_id = 'A1'
+    results_list.append(results_obj)
 
-    
-    unfold_results_dict_averages = average_evoked_across_ids(unfolded_evokeds)
-    unfolded_evokeds.update(unfold_results_dict_averages)
+    average_results = ResultsContainer.create_average([results_obj])
+    average_results.estimate_aic()
+    results_list.append(average_results)
 
-    return unfolded_evokeds
+    # unfolded_evokeds = {}
+    # person_unfolded_evokeds = results_obj.create_evokeds_from_container(
+    #     sampling_rate=sampling_rate,
+    #     montage='biosemi32'
+    # )
+    # # mock data
+    # person_id = 'A1'
+    # unfolded_evokeds[person_id] = person_unfolded_evokeds
+
+    # person_id2 = 'A2'
+    # unfolded_evokeds[person_id2] = person_unfolded_evokeds
+
+    # unfold_results_dict_averages = average_evoked_across_ids(unfolded_evokeds)
+    # unfolded_evokeds.update(unfold_results_dict_averages)
+
+    return results_list
 
 
 # Updated plotting function with sri_mean selection as a slider
+# def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], initial_sri_mean=0.2):
+#     # Set global font size for various elements
+#     plt.rcParams.update({
+#         'font.size': 20,
+#         'axes.titlesize': 15,
+#         'axes.labelsize': 15,
+#         'xtick.labelsize': 15,
+#         'ytick.labelsize': 15,
+#         'legend.fontsize': 15,
+#         'figure.titlesize': 15,
+#     })
+
+#     # Initialize data for the first time with the default sri_mean
+#     results_containers = generate_data(data_simulation_function, initial_sri_mean)
+#     containers_dict = {container.person_id: container for container in results_containers}
+
+#     # Create a dropdown for selecting the ID from results_containers
+#     id_dropdown = widgets.Dropdown(
+#         options=list(containers_dict.keys()),
+#         description='Select ID:',
+#         value=list(containers_dict.keys())[0]  # Default to the first id
+#     )
+
+#     # Retrieve the evoked data for the initially selected ID
+#     evoked_dict = containers_dict[id_dropdown.value].create_evokeds_from_container(
+#         sampling_rate=sampling_rate,
+#         montage='biosemi32'
+#     )
+
+#     # Create a dropdown for event names
+#     event_names = sorted(set(event for event, _ in evoked_dict.keys()))  # Get unique event names
+
+#     event_dropdown = widgets.Dropdown(
+#         options=event_names,
+#         description='Event Name:',
+#         value='baseline'
+#     )
+
+
+#     unfold_results_dict = generate_data(data_simulation_function, initial_sri_mean)
+
+
+#     # SRI Mean slider to control data generation
+#     sri_mean_slider = widgets.FloatSlider(
+#         value=initial_sri_mean,
+#         min=0.1,
+#         max=0.6,
+#         step=0.01,
+#         description='SRI Mean:',
+#         continuous_update=True  # Trigger update only on release for performance
+#     )
+
+#     # Dropdown for selecting ID
+#     id_dropdown = widgets.Dropdown(
+#         options=list(unfold_results_dict.keys()),
+#         description='Select ID:',
+#         value=list(unfold_results_dict.keys())[0]  # Default to the first id
+#     )
+
+#     # Get the corresponding evoked_dict for the initially selected ID
+#     evoked_dict = unfold_results_dict[id_dropdown.value]
+
+#     # Dropdown for event names
+#     event_names = sorted(set(event for event, _ in evoked_dict.keys()))
+#     event_dropdown = widgets.Dropdown(
+#         options=event_names,
+#         description='Event Name:',
+#         value=event_names[0]  # Default to first event
+#     )
+
+#     # Dropdown for electrodes
+#     electrode_toggle = widgets.Dropdown(
+#         options=evoked_dict[('baseline', 'baseline')].info['ch_names'],
+#         description='Electrode:',
+#         value='Cz'
+#     )
+
+#     # Output widget for displaying plots
+#     output = widgets.Output()
+
+#     # Local containers for min and max multiplier text boxes and checkboxes
+#     min_multiplier_boxes = []
+#     max_multiplier_boxes = []
+#     coef_checkboxes = []
+
+#     # Slider for selecting time for topomap
+#     time_slider = widgets.FloatSlider(
+#         description='Time (s)',
+#         continuous_update=False,
+#         layout=widgets.Layout(width='1070px')
+#     )
+
+#     # Function to update coefficients checkboxes and multipliers
+#     def update_coef_checkboxes(event_name):
+#         nonlocal min_multiplier_boxes, max_multiplier_boxes, coef_checkboxes
+#         coefnames = [coef for event, coef in evoked_dict.keys() if event == event_name and coef != '(Intercept)']
+
+#         coef_checkboxes = [widgets.Checkbox(value=False, description=name) for name in set(coefnames)]
+#         min_multiplier_boxes = []
+#         max_multiplier_boxes = []
+
+#         rows = []
+#         for i, name in enumerate(set(coefnames)):
+#             min_box = widgets.FloatText(value=100, description='Min:', layout=widgets.Layout(width='150px'))
+#             max_box = widgets.FloatText(value=500, description='Max:', layout=widgets.Layout(width='150px'))
+#             min_multiplier_boxes.append(min_box)
+#             max_multiplier_boxes.append(max_box)
+#             row = widgets.HBox([coef_checkboxes[i], min_box, max_box])
+#             rows.append(row)
+
+#         if not rows:
+#             return widgets.VBox(coef_checkboxes)
+
+#         return widgets.VBox(rows)
+
+#     # Function to update plot based on selected parameters
+#     def update_plot(event_name, coef_selection, selected_electrode, selected_time):
+#         with output:
+#             output.clear_output()
+
+#             coef_dict = {'(Intercept)': False}
+
+#             for i, row in enumerate(coef_selection):
+#                 checkbox = row.children[0]
+#                 if checkbox.value:
+#                     coefname = checkbox.description
+#                     coef_dict[coefname] = (min_multiplier_boxes[i].value, max_multiplier_boxes[i].value)
+
+#             evoked1, evoked2 = create_combined_evoked(event_name, coef_dict, evoked_dict)
+
+#             time_slider.min = evoked1.times[0]
+#             time_slider.max = evoked1.times[-1]
+#             time_slider.step = evoked1.times[1] - evoked1.times[0]
+#             if time_slider.value < time_slider.min or time_slider.value > time_slider.max:
+#                 time_slider.value = 0.2
+
+#             ch_idx = evoked1.ch_names.index(selected_electrode)
+
+#             plt.figure(figsize=(12, 6))
+#             plt.plot(evoked1.times, evoked1.data[ch_idx], label='Intercept + Min Multiplier', color='blue')
+#             plt.plot(evoked2.times, evoked2.data[ch_idx], label='Intercept + Max Multiplier', color='red')
+#             plt.axvline(x=0, color='gray', linestyle='--')
+#             # Include AIC value in the title if available
+#             title = f'Evoked Response at {selected_electrode}'
+#             if selected_aic is not None:
+#                 title += f' (AIC: {selected_aic:.2f})'
+#             plt.title(title)
+#             plt.xlabel('Time (s)')
+#             plt.ylabel('Amplitude (uV)')
+#             plt.ylim(-1, 15)
+#             plt.legend()
+#             plt.grid(True)
+#             plt.show()
+
+#             display(time_slider)
+
+#             mne.viz.plot_evoked_topomap(evoked1, times=selected_time, show=False)
+#             plt.suptitle(f"Intercept - Min Multiplier at time {selected_time:.3f}s")
+#             plt.show()
+
+#             mne.viz.plot_evoked_topomap(evoked2, times=selected_time, show=False)
+#             plt.suptitle(f"Intercept + Max Multiplier at time {selected_time:.3f}s")
+#             plt.show()
+
+#     # Function to attach listeners to checkboxes and multiplier boxes
+#     def attach_listeners():
+#         for i, checkbox in enumerate(coef_checkboxes):
+#             checkbox.observe(lambda change, idx=i: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                                electrode_toggle.value, time_slider.value),
+#                              names='value')
+#             min_multiplier_boxes[i].observe(
+#                 lambda change, idx=i: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                   electrode_toggle.value, time_slider.value), names='value')
+#             max_multiplier_boxes[i].observe(
+#                 lambda change, idx=i: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                   electrode_toggle.value, time_slider.value), names='value')
+
+#     # Listener for time slider to update topomap when time changes
+#     time_slider.observe(
+#         lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value,
+#                                    time_slider.value), names='value')
+
+#     # Listener for sri_mean changes to regenerate data and update plot
+#     def on_sri_mean_change(change):
+#         nonlocal unfold_results_dict, evoked_dict
+#         unfold_results_dict = generate_data(data_simulation_function, change['new'])
+#         evoked_dict = unfold_results_dict[id_dropdown.value]
+#         update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value, time_slider.value)
+
+#     # Listener to update coef checkboxes when event name changes
+#     def on_event_change(change):
+#         coef_checkboxes_widget.children = update_coef_checkboxes(event_dropdown.value).children
+#         attach_listeners()
+#         update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value, time_slider.value)
+
+#     # Attach the listeners
+#     sri_mean_slider.observe(on_sri_mean_change, names='value')
+#     event_dropdown.observe(on_event_change, names='value')
+#     electrode_toggle.observe(lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                         electrode_toggle.value, time_slider.value), names='value')
+#     id_dropdown.observe(lambda change: update_plot(event_dropdown.value, coef_checkboxes_widget.children,
+#                                                    electrode_toggle.value, time_slider.value), names='value')
+
+#     coef_checkboxes_widget = update_coef_checkboxes(event_dropdown.value)
+#     attach_listeners()
+
+#     # Display all widgets
+#     display(sri_mean_slider, id_dropdown, event_dropdown, coef_checkboxes_widget, electrode_toggle, output)
+#     update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value, time_slider.value)
+
+
 def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], initial_sri_mean=0.2):
     # Set global font size for various elements
     plt.rcParams.update({
@@ -611,9 +984,10 @@ def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], ini
         'legend.fontsize': 15,
         'figure.titlesize': 15,
     })
-    
+
     # Initialize data for the first time with the default sri_mean
-    unfold_results_dict = generate_data(data_simulation_function, initial_sri_mean)
+    results_containers = generate_data(data_simulation_function, initial_sri_mean)
+    containers_dict = {container.person_id: container for container in results_containers}
 
     # SRI Mean slider to control data generation
     sri_mean_slider = widgets.FloatSlider(
@@ -624,16 +998,19 @@ def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], ini
         description='SRI Mean:',
         continuous_update=True  # Trigger update only on release for performance
     )
-    
-    # Dropdown for selecting ID
+
+    # Create a dropdown for selecting the ID from results_containers
     id_dropdown = widgets.Dropdown(
-        options=list(unfold_results_dict.keys()),
+        options=list(containers_dict.keys()),
         description='Select ID:',
-        value=list(unfold_results_dict.keys())[0]  # Default to the first id
+        value=list(containers_dict.keys())[0]  # Default to the first id
     )
-    
-    # Get the corresponding evoked_dict for the initially selected ID
-    evoked_dict = unfold_results_dict[id_dropdown.value]
+
+    # Retrieve the evoked data for the initially selected ID
+    evoked_dict = containers_dict[id_dropdown.value].create_evokeds_from_container(
+        sampling_rate=sampling_rate,
+        montage='biosemi32'
+    )
 
     # Dropdown for event names
     event_names = sorted(set(event for event, _ in evoked_dict.keys()))
@@ -693,6 +1070,11 @@ def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], ini
         with output:
             output.clear_output()
 
+            # Retrieve AIC value for the selected person_id and electrode
+            selected_id = id_dropdown.value
+            selected_container = containers_dict[selected_id]
+            selected_aic = selected_container.aic.get(selected_electrode, None)
+
             coef_dict = {'(Intercept)': False}
 
             for i, row in enumerate(coef_selection):
@@ -715,7 +1097,11 @@ def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], ini
             plt.plot(evoked1.times, evoked1.data[ch_idx], label='Intercept + Min Multiplier', color='blue')
             plt.plot(evoked2.times, evoked2.data[ch_idx], label='Intercept + Max Multiplier', color='red')
             plt.axvline(x=0, color='gray', linestyle='--')
-            plt.title(f'Evoked Response at {selected_electrode}')
+            # Include AIC value in the title if available
+            title = f'Evoked Response at {selected_electrode}'
+            if selected_aic is not None:
+                title += f' (AIC: {selected_aic:.2f})'
+            plt.title(title)
             plt.xlabel('Time (s)')
             plt.ylabel('Amplitude (uV)')
             plt.ylim(-1, 15)
@@ -753,9 +1139,15 @@ def plot_results_dict_sri(data_simulation_function: Callable[[float], dict], ini
 
     # Listener for sri_mean changes to regenerate data and update plot
     def on_sri_mean_change(change):
-        nonlocal unfold_results_dict, evoked_dict
-        unfold_results_dict = generate_data(data_simulation_function, change['new'])
-        evoked_dict = unfold_results_dict[id_dropdown.value]
+        nonlocal containers_dict, evoked_dict
+
+        results_containers = generate_data(data_simulation_function, change['new'])
+        containers_dict = {container.person_id: container for container in results_containers}
+        evoked_dict = containers_dict[id_dropdown.value].create_evokeds_from_container(
+            sampling_rate=sampling_rate,
+            montage='biosemi32'
+        )
+
         update_plot(event_dropdown.value, coef_checkboxes_widget.children, electrode_toggle.value, time_slider.value)
 
     # Listener to update coef checkboxes when event name changes
