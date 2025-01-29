@@ -4,9 +4,9 @@ from himalaya.ridge import RidgeCV
 import logging
 import sys
 
-sys.path.insert(1, '../')
+# sys.path.insert(1, '../')
 
-import unfold_model
+from unfold import unfold_model
 
 # Import the Julia package manager
 from juliacall import Pkg as jlPkg

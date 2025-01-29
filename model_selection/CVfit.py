@@ -4,6 +4,7 @@ import sys
 import pandas as pd
 import numpy as np
 import pickle
+from unfold.simple_ridgeCV_model import UnfoldSimpleRidgeCVModelPy
 
 sys.path.insert(1, '../')
 
@@ -45,17 +46,23 @@ def prepare_data_CV(raw, events_df, start_tp, stop_tp):
     return data_df
 
 
-def create_events_cv(events_df, indices, length):
+def create_events_cv(events_df, indices, length, return_trial=True):
     events_split = []
+    events_split_trial_level = []
     for i, data_index in enumerate(indices):
-        trial_events_df = events_df.iloc[i].copy()
+        # logger.debug(f"EVENTS CV:\n fold num: {i}, data index: {data_index}")
+        trial_events_df = events_df.iloc[data_index].copy()
         offset = i * length
         trial_events_df['latency'] = trial_events_df['latency'].apply(lambda x: x + offset)
         events_split.append(trial_events_df)
+        events_split_trial_level.append(events_df.iloc[data_index].copy())
 
     events_split_df = pd.concat(events_split, ignore_index=True)
 
-    return events_split_df
+    if return_trial:
+        return events_split_df, events_split_trial_level
+    else:
+        return events_split_df
 
 
 class UnfoldModelPyCV:
@@ -132,6 +139,9 @@ class UnfoldModelPyCV:
             cv_predicted_test = []
             cv_original_test = []
             split_num = []
+            alphas = []
+            cv_events_train = []
+            cv_events_test = []
 
             # prepare data for splitting - divide events-df and raw signal into trials
             data_df = prepare_data_CV(eeg_data, events_df, start_tp=-13, stop_tp=101)
@@ -150,23 +160,41 @@ class UnfoldModelPyCV:
 
                 continuous_train = np.vstack(epochs_train).flatten().reshape(1, -1)
                 logger.debug(f"Continuous train shape: {continuous_train.shape}")
-                channel_events_train_df = create_events_cv(data_df['event_df'], train_index, length)
+                channel_events_train_df, channel_events_trials_train = create_events_cv(data_df['event_df'], train_index, length)
 
                 epochs_test = np.vstack(data_df['eeg_signal'].to_numpy()[test_index])
                 continuous_test = np.vstack(epochs_test).flatten().reshape(1, -1)
                 logger.debug(f"Continuous test shape: {continuous_test.shape}")
-                channel_events_test_df = create_events_cv(data_df['event_df'], test_index, length)
+                channel_events_test_df, channel_events_trials_test = create_events_cv(data_df['event_df'], test_index, length)
 
                 # perform unfold with train/test
                 self.estimator.fit(signal=continuous_train, events_df=channel_events_train_df)
+
+                # predict on the train and test data
                 predicted_raw_train = self.estimator.predict(signal=continuous_train, events_df=channel_events_train_df)
                 predicted_raw_test = self.estimator.predict(signal=continuous_test, events_df=channel_events_test_df)
 
+                # Add info on chosen alpha in the split
+                if hasattr(self.estimator, 'linear_estimator'):
+                    alphas.append(self.estimator.linear_estimator.best_alphas_)
+                else:
+                    alphas.append(None)
+
+                # add events from the split
+                cv_events_train.append(channel_events_trials_train)
+                cv_events_test.append(channel_events_trials_test)
+
                 if as_epochs:
-                    cv_predicted_train.append(
-                        np.array(unfold_model.epochs_from_raw(predicted_raw_train, channel_events_train_df)))
-                    cv_predicted_test.append(
-                        np.array(unfold_model.epochs_from_raw(predicted_raw_test, channel_events_test_df)))
+                    if predicted_raw_train.shape == epochs_train.shape:
+                        cv_predicted_train.append(
+                            np.array(predicted_raw_train))
+                        cv_predicted_test.append(
+                            np.array(predicted_raw_test))
+                    else:
+                        cv_predicted_train.append(
+                            np.array(unfold_model.epochs_from_raw(predicted_raw_train, channel_events_train_df)))
+                        cv_predicted_test.append(
+                            np.array(unfold_model.epochs_from_raw(predicted_raw_test, channel_events_test_df)))
                     cv_original_train.append(np.array(epochs_train))
                     cv_original_test.append(np.array(epochs_test))
                 else:
@@ -175,12 +203,19 @@ class UnfoldModelPyCV:
                     cv_original_train.append(np.array(continuous_train))
                     cv_original_test.append(np.array(continuous_test))
 
+            # TODO: change it to assert
+            logger.debug(f"split len: {len(split_num)}\nalphas len: {len(alphas)}\ntrain events len: {len(cv_events_train)}\ntest events len:{len(cv_events_test)}")
+
+            # create results df
             cv_results_df = pd.DataFrame({
                 'split_num': split_num,
+                'alphas': alphas,
                 'train_original': cv_original_train,
                 'train_predicted': cv_predicted_train,
                 'test_original': cv_original_test,
                 'test_predicted': cv_predicted_test,
+                'train_events': cv_events_train,
+                'test_events': cv_events_test
             })
 
             self.cv_results[channel_name] = cv_results_df
