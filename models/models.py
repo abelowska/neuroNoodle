@@ -24,6 +24,7 @@ jl.seval("using UnfoldDecode")
 Unfold = jl.Unfold
 UnfoldDecode = jl.UnfoldDecode
 
+
 @cache
 def get_full_interaction_model():
     return jl.seval("""
@@ -97,6 +98,29 @@ def get_full_stop_type_ssd_model():
 
 
 @cache
+def get_full_stop_type_stop_ssd_model():
+    return jl.seval("""
+            bf_baseline = firbasis(τ = (0, 1.58), sfreq = 64)
+            bf_go = firbasis(τ = (-0.2, 1.58), sfreq = 64)
+            bf_stop = firbasis(τ = (-0.2, 0.5), sfreq = 64)
+            bf_response_stop = firbasis(τ = (-0.1, 0.6), sfreq = 64)
+            bf_response_nostop = firbasis(τ = (0-0.1, 0.6), sfreq = 64)
+            f_baseline = @formula 0 ~ baseline
+            f_go = @formula 0 ~ 1
+            f_stop = @formula 0 ~ 1 + stop_type + ssd_centered
+            f_response_stop = @formula 0 ~ 1
+            f_response_nostop = @formula 0 ~ 1
+            [
+                "baseline" => (f_baseline, bf_baseline),    
+                "go" => (f_go, bf_go),      
+                "stop" => (f_stop, bf_stop), 
+                "response_stop" => (f_response_stop, bf_response_stop),
+                "response_nostop" => (f_response_nostop, bf_response_nostop)
+            ]
+        """
+                    )
+
+@cache
 def get_full_stop_type_model():
     return jl.seval("""
             bf_baseline = firbasis(τ = (0, 1.58), sfreq = 64)
@@ -139,6 +163,27 @@ def get_full_model():
                 "stop" => (f_stop, bf_stop), 
                 "response_stop" => (f_response_stop, bf_response_stop),
                 "response_nostop" => (f_response_nostop, bf_response_nostop)
+            ]
+        """
+                    )
+
+
+@cache
+def get_response_model():
+    return jl.seval("""
+            bf_baseline = firbasis(τ = (0, 1.58), sfreq = 64)
+            bf_go = firbasis(τ = (-0.2, 1.58), sfreq = 64)
+            bf_stop = firbasis(τ = (-0.2, 0.5), sfreq = 64)
+            bf_response = firbasis(τ = (-0.1, 0.6), sfreq = 64)
+            f_baseline = @formula 0 ~ baseline
+            f_go = @formula 0 ~ 1
+            f_stop = @formula 0 ~ 1 
+            f_response = @formula 0 ~ 1 
+            [
+                "baseline" => (f_baseline, bf_baseline),    
+                "go" => (f_go, bf_go),      
+                "stop" => (f_stop, bf_stop), 
+                "response" => (f_response, bf_response),
             ]
         """
                     )

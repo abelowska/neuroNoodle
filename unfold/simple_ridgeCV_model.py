@@ -110,13 +110,13 @@ def to_julia_vector(julia_type, python_list):
     return jl.seval("Vector{" + julia_type + "}")(python_list)
 
 
-def get_events_jl(events_df):
+def get_events_jl(events_df, eventcolumn='type'):
     df = events_df
 
     df['sri'] = df['sri'].fillna(0)
     df['ssd'] = df['ssd'].fillna(0)
 
-    type_column = to_julia_vector("String", df['type'].tolist())
+    type_column = to_julia_vector("String", df[f"{eventcolumn}"].tolist())
     response_type_column = to_julia_vector("String", df['response_type'].tolist())
     stop_type_column = to_julia_vector("String", df['stop_type'].tolist())
     ssd_centered_column = to_julia_vector("Float64", df['ssd'].tolist())
@@ -138,13 +138,14 @@ def get_events_jl(events_df):
 
 
 class UnfoldSimpleRidgeCVModelPy:
-    def __init__(self, u_model, linear_estimator):
+    def __init__(self, u_model, linear_estimator, event_column):
         self.u_model = u_model
         self.num_parameters = None
         self.coeftable = None
         self.linear_estimator = linear_estimator
         self.num_parameters = None
         self.coefs = None,
+        self.event_column = event_column
 
     def fit(self, signal, events_df):
         model_matrix = self.get_model_matrix(signal, events_df)
@@ -164,7 +165,7 @@ class UnfoldSimpleRidgeCVModelPy:
         betas = self.coeftable.copy()['estimate'].to_numpy()
 
         signal = np.ravel(signal)
-        events_df_jl = get_events_jl(events_df)
+        events_df_jl = get_events_jl(events_df, eventcolumn=self.event_column)
 
         # create X from events_df
         m = Unfold.fit(
@@ -172,7 +173,7 @@ class UnfoldSimpleRidgeCVModelPy:
             self.u_model,
             events_df_jl,
             signal,
-            eventcolumn="type",
+            eventcolumn='type',
         )
         X = Unfold.modelmatrix(m)
 
@@ -182,7 +183,7 @@ class UnfoldSimpleRidgeCVModelPy:
 
     def get_model_matrix(self, signal, events_df):
         signal = np.ravel(signal)
-        events_df_jl = unfold_model.get_events_jl(events_df)
+        events_df_jl = get_events_jl(events_df, eventcolumn=self.event_column)
 
         # Fit Unfold model
         m = Unfold.fit(
@@ -190,7 +191,7 @@ class UnfoldSimpleRidgeCVModelPy:
             self.u_model,
             events_df_jl,
             signal,
-            eventcolumn="type",
+            eventcolumn='type',
         )
 
         model_matrix = np.array(Unfold.modelmatrix(m))

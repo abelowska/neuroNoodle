@@ -81,7 +81,7 @@ class UnfoldModelPyCV:
             cv=ShuffleSplit(n_splits=20, random_state=42, test_size=0.50),
             channels='all',
             as_epochs=True,
-            refit=False
+            refit=False,
     ):
         """
 
